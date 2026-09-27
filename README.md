@@ -61,6 +61,8 @@ YCloud.
 | | YCloud | Kapso |
 | --- | --- | --- |
 | Disponible en EE. UU. | ❌ | ✅ |
+
+
 | Identidad del emisor | `phone_number` (E.164) | `phone_number_id` de Meta |
 | Plantillas | WABA resuelto desde el número | `waba_id` configurado (se autocompleta) |
 | Firma del webhook | con timestamp, ventana anti-replay de 300 s | HMAC-SHA256 sin timestamp |
