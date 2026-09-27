@@ -10,6 +10,7 @@ import {
 } from "./state-machine";
 import { reserveLlmTurn } from "./cost-tracker";
 import { getEnabledTools } from "@/features/tools/services/tool-configs";
+import { shouldAbstainForSchedule } from "./schedule-guard";
 import type { Tool } from "@/features/tools/core/tool";
 
 function svc() {
@@ -34,6 +35,7 @@ export interface DecisionResult {
  * Flow:
  *   1. Load conversation state from DB
  *   2. If state !== 'ai_active' → abstain
+ *   2b. If within human business hours (ai_schedule) → abstain
  *   3. detectsHandoffTrigger → if true, transition to handoff_pending and log
  *   4. load the enabled tools
  *   5. reserveLlmTurn (last: nothing may throw after it) → if exceeded,
@@ -72,16 +74,19 @@ export async function decide(opts: {
     return { decision: "abstain", reason: `state:${currentState}` };
   }
 
+  // 2b. Check if we're within human business hours (agent schedule)
+  try {
+    const withinHumanHours = await shouldAbstainForSchedule(workspaceId);
+    if (withinHumanHours) {
+      return { decision: "abstain", reason: "within_human_hours" };
+    }
+  } catch (err) {
+    // Non-fatal: if schedule check fails, let the agent respond anyway
+    console.error("[decision-engine] schedule check failed:", err);
+  }
+
   // 3. Detect handoff trigger in message text
   if (detectsHandoffTrigger(mergedText)) {
-    // Route through the single choke point for state changes so every side
-    // effect of entering handoff_pending (event log, contact notification)
-    // fires. This no longer swallows the error: if it throws, decide()
-    // propagates it instead of reporting a successful handoff that never
-    // happened. processNextBatch() (buffer.ts) already retries transient
-    // failures with backoff and dead-letters after MAX_BATCH_RETRIES — that
-    // is the correct place for this to be handled, not a second bespoke
-    // retry here.
     if (canTransition(currentState, "handoff_pending")) {
       await applyTransition(conversationId, "handoff_pending", {
         trigger: "keyword",
@@ -95,8 +100,7 @@ export async function decide(opts: {
   // here may throw, or the slot would be spent with no one holding its id.
   const availableTools = await getEnabledTools(workspaceId);
 
-  // 5. Rate limit check — atomically reserves a turn slot so two concurrent
-  // batches for the same contact can't both pass. A retry keeps its slot.
+  // 5. Rate limit check
   const {
     allowed,
     reason: rateLimitReason,
@@ -116,27 +120,11 @@ export async function decide(opts: {
 }
 
 export interface TransitionOptions {
-  /** Set when a human drove the transition — becomes assigned_to + event actor. */
   userId?: string;
-  /** What caused it: keyword | agent | manual. Recorded in the event payload. */
   trigger?: string;
-  /**
-   * Scope guard. When set, the conversation must belong to this workspace:
-   * lookup and update both filter by it, so a caller that already verified
-   * membership cannot be tricked into moving another tenant's conversation.
-   */
   workspaceId?: string;
 }
 
-/**
- * Applies a validated state transition to a conversation.
- * Logs the transition to the events table.
- * If transitioning to human_active and userId is provided, sets assigned_to.
- *
- * This is the single choke point for state changes: every side effect of
- * entering a state hangs off here, so all callers must go through it rather
- * than UPDATE `conversations` directly.
- */
 export async function applyTransition(
   conversationId: string,
   to: ConversationState,
@@ -145,7 +133,6 @@ export async function applyTransition(
   const { userId, trigger, workspaceId } = opts;
   const supabase = svc();
 
-  // 1. Load current state (scoped to the workspace when the caller gives one)
   let lookup = supabase
     .from("conversations")
     .select("state, workspace_id")
@@ -161,13 +148,11 @@ export async function applyTransition(
 
   const currentState = conv.state as ConversationState;
 
-  // 2. Validate transition (throws TransitionError if invalid)
   if (!canTransition(currentState, to)) {
     const { TransitionError } = await import("./state-machine");
     throw new TransitionError(currentState, to);
   }
 
-  // 3. Build the update payload
   const updatePayload: Record<string, unknown> = {
     state: to,
     ai_enabled: to === "ai_active",
@@ -191,7 +176,6 @@ export async function applyTransition(
     );
   }
 
-  // 4. Log the state change to events
   await supabase.from("events").insert({
     type: "state_change",
     level: "info",
@@ -205,9 +189,6 @@ export async function applyTransition(
     },
   });
 
-  // 5. Side effects of the new state. Deliberately last and deliberately
-  //    non-throwing: the transition above is already committed and must stand
-  //    even if notifying anyone fails.
   if (to === "handoff_pending") {
     try {
       const { notifyHandoffPending } = await import("./handoff-notifier");
