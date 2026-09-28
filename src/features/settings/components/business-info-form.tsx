@@ -29,7 +29,7 @@ interface AiSchedule {
 }
 
 const DEFAULT_BLOCKS: ScheduleBlock[] = [
-  { days: [1, 2, 3, 4, 5], from: "10:00", to: "13:30" },
+  { days: [1, 2, 3, 4, 5], from: "10:00", to: "15:00" },
   { days: [1, 2, 3, 4, 5], from: "15:00", to: "18:00" },
 ];
 
