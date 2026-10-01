@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { inboundContentText } from "./inbound-content";
+import type { OutboundEcho } from "./kapso-webhook-handler";
 
 /**
  * Verifies a YCloud webhook signature.
@@ -214,6 +215,82 @@ export function parseInbound(body: unknown): NormalizedInbound | null {
       mediaId,
       mediaMime,
       mediaFilename,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parses a message the business sent from the WhatsApp Business App (coexistence).
+ *
+ * YCloud echoes these as `whatsapp.smb.message.echoes` events. Without catching
+ * them, the inbox never knows someone already answered and the AI agent happily
+ * replies over the human.
+ *
+ * History-sync backfills (`whatsapp.smb.history`) are NOT live activity and are
+ * excluded — they represent old messages, not a person picking up the phone
+ * right now.
+ *
+ * Returns null for non-echo events, malformed payloads, or events we choose to
+ * skip (like history syncs).
+ */
+export function parseOutboundEcho(body: unknown): OutboundEcho | null {
+  try {
+    if (typeof body !== "object" || body === null) return null;
+    const event = body as Record<string, unknown>;
+
+    // Only process live echoes, never history backfills.
+    if (event.type !== "whatsapp.smb.message.echoes") return null;
+
+    const wm = event.whatsappMessage;
+    if (typeof wm !== "object" || wm === null) return null;
+    const wmObj = wm as Record<string, unknown>;
+
+    const wamid = typeof wmObj.wamid === "string" ? wmObj.wamid : null;
+    if (!wamid) return null;
+
+    const to = typeof wmObj.to === "string" ? wmObj.to : null;
+    if (!to) return null;
+
+    const msgType = typeof wmObj.type === "string" ? wmObj.type : "unknown";
+
+    let text: string | null = null;
+    if (msgType === "text") {
+      // YCloud echoes may send text as a plain string OR as { body: "..." }.
+      if (typeof wmObj.text === "string") {
+        text = wmObj.text;
+      } else if (typeof wmObj.text === "object" && wmObj.text !== null) {
+        const textObj = wmObj.text as Record<string, unknown>;
+        text = typeof textObj.body === "string" ? textObj.body : null;
+      }
+    } else if (MEDIA_TYPES.includes(msgType)) {
+      // Media messages: try caption, fall back to "[Multimedia]".
+      const mediaObj = wmObj[msgType];
+      if (typeof mediaObj === "object" && mediaObj !== null) {
+        const m = mediaObj as Record<string, unknown>;
+        if (typeof m.caption === "string" && m.caption.trim()) {
+          text = m.caption;
+        }
+      }
+      if (text === null) text = "[Multimedia]";
+    } else {
+      text = "[Multimedia]";
+    }
+
+    return {
+      to,
+      wamid,
+      type: toMessageType(msgType),
+      text,
+      createTime:
+        typeof wmObj.createTime === "string"
+          ? wmObj.createTime
+          : typeof event.createTime === "string"
+            ? (event.createTime as string)
+            : new Date().toISOString(),
+      // YCloud uses phone numbers directly, not Meta phone_number_ids.
+      phoneNumberId: null,
     };
   } catch {
     return null;
