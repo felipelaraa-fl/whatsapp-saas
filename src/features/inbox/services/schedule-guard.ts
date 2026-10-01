@@ -105,11 +105,11 @@ export async function loadAiSchedule(
     .maybeSingle();
 
   if (error || !data?.structured) {
-    return { schedule: null, timezone: "America/Mexico_City" };
+    return { schedule: null, timezone: "America/Santiago" };
   }
 
   const s = data.structured as Record<string, unknown>;
-  const timezone = (s.timezone as string) || "America/Mexico_City";
+  const timezone = (s.timezone as string) || "America/Santiago";
   const aiSchedule = s.ai_schedule as AiSchedule | undefined;
 
   if (!aiSchedule?.enabled) {
