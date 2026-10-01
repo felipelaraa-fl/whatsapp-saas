@@ -3,8 +3,12 @@ import { createClient as createSbClient } from "@supabase/supabase-js";
 import {
   verifyYCloudSignature,
   parseInbound,
+  parseOutboundEcho,
 } from "@/features/inbox/services/ycloud-webhook-handler";
-import { processInbound } from "@/features/inbox/services/normalizer";
+import {
+  processInbound,
+  processOutboundEcho,
+} from "@/features/inbox/services/normalizer";
 import { checkRateLimits } from "@/features/inbox/services/cost-tracker";
 import {
   hasTimeToClaim,
@@ -64,7 +68,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
     }
 
-    // WH-02: classify the event. Status updates carry NO `to` phone — they can
+    // WH-02: classify the event. Status updates carry NO `to` phone â they can
     // only be routed via the ?wsid query param. Signature verification MUST
     // happen before we act on EITHER a status update or an inbound message.
     const isStatusUpdate =
@@ -72,6 +76,15 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       body !== null &&
       "type" in body &&
       (body as { type: string }).type === "whatsapp.message.updated";
+
+    // Coexistence: a `whatsapp.smb.message.echoes` event is a human answering
+    // from the WhatsApp Business App on their phone. It carries the business
+    // phone in whatsappMessage.from, not in whatsappInboundMessage.to.
+    const isEchoEvent =
+      typeof body === "object" &&
+      body !== null &&
+      "type" in body &&
+      (body as { type: string }).type === "whatsapp.smb.message.echoes";
 
     // Extract destination phone to identify the workspace integration (inbound).
     const toPhone =
@@ -82,9 +95,16 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
             .whatsappInboundMessage?.to ?? null)
         : null;
 
+    // Echo events carry the business phone in whatsappMessage.from (the sender).
+    const echoFromPhone = isEchoEvent
+      ? ((body as { whatsappMessage?: { from?: string } })
+          ?.whatsappMessage?.from ?? null)
+      : null;
+
     // Events that carry NO actionable data AND cannot identify a workspace
-    // (no wsid, no inbound `to`, not a status update) → harmless early 200.
-    if (!isStatusUpdate && !toPhone && !wsidParam) {
+    // (no wsid, no inbound `to`, no echo from, not a status update) â harmless
+    // early 200.
+    if (!isStatusUpdate && !isEchoEvent && !toPhone && !wsidParam) {
       return NextResponse.json({ received: true });
     }
 
@@ -99,7 +119,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     let ws: IntegrationRow | null = null;
 
     if (wsidParam) {
-      // E3: direct lookup by workspace_id — faster, no phone scan needed.
+      // E3: direct lookup by workspace_id â faster, no phone scan needed.
       // Status updates always take this path (they have no inbound `to`).
       const { data } = await supabase
         .from("integrations")
@@ -110,7 +130,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         .single();
       ws = data ?? null;
     } else {
-      // Fallback: phone-based lookup across all enabled integrations (inbound)
+      // Fallback: phone-based lookup across all enabled integrations (inbound
+      // and echo events both carry the business phone â inbound in
+      // whatsappInboundMessage.to, echo in whatsappMessage.from).
       const { data: integrations } = await supabase
         .from("integrations")
         .select("workspace_id, credentials, config")
@@ -118,7 +140,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         .eq("enabled", true)
         .limit(10);
 
-      const destination = phoneString(toPhone);
+      const destination = phoneString(toPhone ?? echoFromPhone);
       ws =
         (integrations ?? []).find((i: IntegrationRow) => {
           const configured = phoneString(i.config?.phone_number);
@@ -126,14 +148,14 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         }) ?? null;
     }
 
-    // No resolvable workspace → 401. A status update without a resolvable
+    // No resolvable workspace â 401. A status update without a resolvable
     // (and below, verified) workspace must NEVER fall through to 200.
     if (!ws) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // The workspace was resolved via config.phone_number / wsid — both
-    // plaintext — so decryption happens only after we know which row we need.
+    // The workspace was resolved via config.phone_number / wsid â both
+    // plaintext â so decryption happens only after we know which row we need.
     const creds = (await decryptCredentials(
       ws.credentials,
       ws.workspace_id,
@@ -153,7 +175,24 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // WH-02: monotonic status updates — only reached after signature verification.
+    // Coexistence: a `whatsapp.smb.message.echoes` carrying outbound content is
+    // a human answering from the WhatsApp Business App on their phone. Record it
+    // and hand the conversation to them, before the status branch can swallow it.
+    if (isEchoEvent) {
+      const echo = parseOutboundEcho(body);
+      if (echo) {
+        const result = await processOutboundEcho(ws.workspace_id, echo);
+        return NextResponse.json({
+          received: true,
+          echo: true,
+          recorded: result.inserted,
+          aiDisabled: result.aiDisabled,
+        });
+      }
+      return NextResponse.json({ received: true });
+    }
+
+    // WH-02: monotonic status updates â only reached after signature verification.
     if (isStatusUpdate) {
       const statusData = (
         body as {
@@ -180,7 +219,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     }
 
     // Routed by ?wsid, the signature only proves the event came from YCloud
-    // with this workspace's secret — not that it is for this workspace's
+    // with this workspace's secret â not that it is for this workspace's
     // number. A message for another number is ignored and left as an event
     // for the workspace (once a day), never filed under it. The check needs
     // the configured number with its country code: a national one is
@@ -201,7 +240,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
       if (destination === "mismatch") {
         console.warn(
-          "[webhook] inbound for another number on this workspace's webhook URL — ignored",
+          "[webhook] inbound for another number on this workspace's webhook URL â ignored",
         );
         after(() =>
           emitEventOncePerDay(supabase, workspaceId, "inbound_destination_mismatch", "warn", {
@@ -227,7 +266,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       normalized,
     );
 
-    // Duplicate wamid — already processed
+    // Duplicate wamid â already processed
     if (!message) {
       return NextResponse.json({ received: true, dedup: true });
     }
@@ -291,13 +330,13 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       return NextResponse.json({ received: true, reaction: true });
     }
 
-    // AI is toggled off — still fetch the media so the human agent sees it.
+    // AI is toggled off â still fetch the media so the human agent sees it.
     if (!conversation.ai_enabled) {
       if (mediaJob) after(mediaJob);
       return NextResponse.json({ received: true, ai: false });
     }
 
-    // Rate-limit check — still runs here to avoid buffering rate-limited contacts
+    // Rate-limit check â still runs here to avoid buffering rate-limited contacts
     const { allowed, reason } = await checkRateLimits(workspaceId, contact.id);
     if (!allowed) {
       // SEC-09: log only non-sensitive fields (no credentials or contact PII)
@@ -306,7 +345,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       return NextResponse.json({ received: true, rateLimited: true });
     }
 
-    // Buffer the message — AI reply is deferred to the cron job.
+    // Buffer the message â AI reply is deferred to the cron job.
     // The silence window is configurable per workspace (YCloud settings).
     const bufferSeconds = Number(
       (ws.config as { buffer_silence_seconds?: number }).buffer_silence_seconds,
@@ -326,7 +365,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     // Best-effort fast path: process the batch the moment its buffer window
     // closes, instead of waiting up to ~60s for the next cron tick. Runs after
     // the response is sent. If the function is recycled before it fires, the
-    // every-minute cron still picks the batch up — so this only ever speeds
+    // every-minute cron still picks the batch up â so this only ever speeds
     // things up, never breaks them. A later message extends flush_at, so an
     // early fire simply claims nothing and the latest fire does the work.
     const effectiveSilenceMs = silenceMs ?? 30_000;
@@ -351,7 +390,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
     return NextResponse.json({ received: true, buffered: true });
   } catch (err) {
-    // SEC-09: never log full error objects — they may contain credentials or raw payloads
+    // SEC-09: never log full error objects â they may contain credentials or raw payloads
     console.error(
       "[webhook] unhandled error:",
       err instanceof Error ? err.message : "unknown error",
