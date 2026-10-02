@@ -145,6 +145,58 @@ export function buildBusinessInfoContext(info: BusinessInfo | null): string {
   return lines.join("\n");
 }
 
+// ── Scheduling-rules block for the system prompt ────────────────────────────
+// Reads `structured.scheduling_rules` from business_info and builds a text
+// block that instructs the agent how to handle appointment timing.
+
+export interface SchedulingRules {
+  enabled: boolean;
+  /** Last bookable slot, e.g. "17:30". Slots after this are filtered out. */
+  last_slot_time: string;
+  /** Hour before which same-day afternoon booking is allowed, e.g. "12:00". */
+  same_day_cutoff: string;
+  /** Afternoon block start, e.g. "15:00". */
+  same_day_afternoon_start: string;
+  /** Clinic hours for display in the prompt. */
+  clinic_hours?: string;
+}
+
+export function buildSchedulingRulesBlock(
+  structured: Record<string, unknown> | null | undefined,
+): string | null {
+  const raw = (structured as { scheduling_rules?: SchedulingRules } | null)
+    ?.scheduling_rules;
+  if (!raw?.enabled) return null;
+
+  const lastSlot = raw.last_slot_time ?? "17:30";
+  const cutoff = raw.same_day_cutoff ?? "12:00";
+  const afternoonStart = raw.same_day_afternoon_start ?? "15:00";
+  const hours = raw.clinic_hours ?? "Lunes a Viernes, 10:00-13:30 y 15:00-18:00";
+
+  return (
+    "## Reglas de Agendamiento (OBLIGATORIAS)\n\n" +
+    `Horario de atención: ${hours}.\n\n` +
+    `1. NUNCA ofrezcas ni agendes una cita después de las ${lastSlot}. ` +
+    `La última hora disponible es ${lastSlot}. Si check_availability devuelve ` +
+    `horarios posteriores a las ${lastSlot}, ignóralos y no los ofrezcas al paciente.\n` +
+    `2. Si el paciente quiere hora para HOY:\n` +
+    `   - Si la hora actual es ANTES de las ${cutoff}: puedes ofrecer horarios de la tarde del mismo día (${afternoonStart}-${lastSlot}).\n` +
+    `   - Si la hora actual es DESPUÉS de las ${cutoff}: NO ofrezcas hoy. Solo ofrece horarios a partir del SIGUIENTE día hábil (lunes a viernes).\n` +
+    `   - Si es VIERNES después de las ${cutoff}: los próximos horarios disponibles son para el LUNES siguiente.\n` +
+    `3. Cuando consultes check_availability, usa date_from del día correcto según estas reglas. ` +
+    `NO consultes el día de hoy si ya pasó las ${cutoff}, consulta directamente desde mañana (o lunes si es viernes).\n` +
+    `4. Si el paciente pide una hora específica que viole estas reglas, ` +
+    `explícale amablemente que no hay disponibilidad y ofrécele la primera opción válida.\n` +
+    `5. FINES DE SEMANA: la clínica NO atiende sábados ni domingos. ` +
+    `Si el paciente pide hora para sábado o domingo, explícale amablemente que la clínica ` +
+    `atiende solo de lunes a viernes y ofrécele la primera hora disponible del siguiente día hábil (lunes).\n` +
+    `6. ESPECIALISTAS: si el paciente pregunta por una hora con un especialista o por una especialidad ` +
+    `(dermatología, traumatología, cardiología, u otra), NO agendes directamente. ` +
+    `Indícale que las horas de especialidad deben ser coordinadas por recepción ` +
+    `y ofrécele pasar la conversación al equipo humano para que le ayuden con esa gestión.`
+  );
+}
+
 /**
  * Upserts business info for a workspace.
  * Merges partial updates — only provided fields are overwritten.
