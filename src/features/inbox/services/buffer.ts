@@ -22,6 +22,7 @@ import {
   getBusinessInfo,
   buildBusinessInfoContext,
   buildNowContext,
+  buildSchedulingRulesBlock,
 } from "./business-info";
 import {
   searchKb,
@@ -822,6 +823,7 @@ export async function processNextBatch(): Promise<ProcessBatchResult> {
       kbContext,
       responseStyle: activeAgent?.config.responseStyle ?? null,
       guardrails: resolvedPrompt?.guardrails ?? null,
+      schedulingRules: buildSchedulingRulesBlock(structured),
       vars: {
         agentName: activeAgent?.name ?? null,
         businessName: structured?.name ?? null,
