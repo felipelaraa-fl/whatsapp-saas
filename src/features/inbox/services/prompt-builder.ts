@@ -36,6 +36,8 @@ export interface BuildSystemPromptParts {
   responseStyle?: ResponseStyle | null;
   guardrails?: PromptGuardrails | null;
   vars?: SystemPromptVars;
+  /** Scheduling-rules block injected between the format note and guardrails. */
+  schedulingRules?: string | null;
 }
 
 // "balanced" is the natural default → no block, keeps the prompt lean.
@@ -79,7 +81,7 @@ const TOOL_HONESTY_NOTE =
   "basta con que el cliente lo pida.\n" +
   "Esto es REACTIVO: aplica solo cuando el cliente ya pidió algo concreto. " +
   "NUNCA anuncies, enumeres ni aclares tus limitaciones por tu cuenta, y " +
-  "menos al saludar: un “Hola” se responde saludando y preguntando en qué " +
+  'menos al saludar: un "Hola" se responde saludando y preguntando en qué ' +
   "puedes ayudar, sin listar lo que puedes o no puedes hacer.";
 
 export function substituteVars(text: string, vars?: SystemPromptVars): string {
@@ -134,6 +136,7 @@ export function buildSystemPrompt(parts: BuildSystemPromptParts): string {
     base,
     WHATSAPP_FORMAT_NOTE,
     MEDIA_CAPABILITY_NOTE,
+    parts.schedulingRules ?? "",
     guardrailsBlock,
     TOOL_HONESTY_NOTE,
   ]
